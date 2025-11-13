@@ -3,51 +3,46 @@ FSDP PPO Trainer with Ray-based single controller.
 Adapted from the excellently written verl implementation.
 """
 
-import json
 import os
 import uuid
-from collections import defaultdict
-from contextlib import contextmanager
-from copy import deepcopy
-from dataclasses import dataclass, field
-from enum import Enum
-from pprint import pprint
-from typing import Dict, Optional, Type
-
-import numpy as np
 import ray
 import torch
-from codetiming import Timer
+import numpy as np
+from collections import defaultdict
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+from pprint import pprint
+from copy import deepcopy
 
 from verl import DataProto
+from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from ragen.trainer import core_algos
-from ragen.trainer.core_algos import agg_loss
+from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    reduce_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
+from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.rollout.async_server import AsyncLLMServerManager
-
-WorkerType = Type[Worker]
 
 
-from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager, compute_response_mask, _timer, apply_kl_penalty, AdvantageEstimator
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager, compute_response_mask, apply_kl_penalty, AdvantageEstimator
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as VerlRayPPOTrainer
 
 import torch
@@ -55,6 +50,8 @@ from verl.utils.torch_functional import masked_mean
 
 from ragen.llm_agent.agent_proxy import LLMAgentProxy
 from ragen.utils import GenerationsLogger
+from ragen.trainer.rollout_filter import build_rollout_filter
+
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, bi_level_gae=False, high_level_gamma=1.0):
@@ -186,6 +183,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             actor_rollout_wg=self.actor_rollout_wg,
             tokenizer=self.tokenizer
         )
+
     def _maybe_log_generations(self, inputs, outputs, scores, _type="val"):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -300,85 +298,19 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         return metric_dict
 
     def init_workers(self):
-        """Init resource pool and worker group"""
-        self.resource_pool_manager.create_resource_pool()
- 
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        super().init_workers()
 
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy and not self.ref_in_actor:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy], config=self.config.actor_rollout_ref, role="ref")
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        self.wg_dicts = []
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
-            self.wg_dicts.append(wg_dict)
-
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            self.critic_wg.init_model()
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
-
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
-        self.actor_rollout_wg.init_model()
-
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async":
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AsyncLLMServerManager(
-                config=self.config.actor_rollout_ref,
-                worker_group=self.actor_rollout_wg,
-            )
+        # create rollout filter
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        rollout_metric = getattr(rollout_cfg, "rollout_filter_metric", "reward_variance")
+        self.rollout_filter = build_rollout_filter(
+            ratio=rollout_cfg.rollout_filter_ratio,
+            filter_type=rollout_cfg.rollout_filter_type,
+            num_groups=self.config.es_manager.train.env_groups,
+            group_size=self.config.es_manager.train.group_size,
+            metric=rollout_metric,
+            compute_log_prob=self.actor_rollout_wg.compute_log_prob,
+        )
 
 
     def _save_checkpoint(self):
@@ -458,47 +390,6 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             scores = batch.batch["rm_scores"].sum(-1).cpu().tolist()
             return inputs, outputs, scores
 
-        def _filter_rollout(batch):
-            """filter rollout based on in-group max - in-group mean. We want those groups to have high-quality rollouts that deviates significantly from the mean"""
-            rollout_filter_ratio = self.config.actor_rollout_ref.rollout.rollout_filter_ratio
-            num_groups, group_size = self.config.es_manager.train.env_groups, self.config.es_manager.train.group_size
-
-            rm_scores = batch.batch["original_rm_scores"].sum(dim=-1).view(num_groups, group_size)
-            in_group_std = rm_scores.std(dim=-1)
-            in_group_max = rm_scores.max(dim=-1).values
-            in_group_mean = rm_scores.mean(dim=-1)
-            if rollout_filter_ratio == 1:
-                return batch, {"rollout/in_group_std": in_group_std.mean(), "rollout/in_group_max": in_group_max.mean(), "rollout/in_group_mean": in_group_mean.mean(), "rollout/chosen_in_group_std": in_group_std.mean(), "rollout/chosen_in_group_max": in_group_max.mean(), "rollout/chosen_in_group_mean": in_group_mean.mean()}
-
-            if self.config.actor_rollout_ref.rollout.rollout_filter_type == "std_rev":
-                top_groups = (-in_group_std).topk(int(rollout_filter_ratio * num_groups)).indices
-            elif self.config.actor_rollout_ref.rollout.rollout_filter_type == "std":
-                top_groups = in_group_std.topk(int(rollout_filter_ratio * num_groups)).indices
-            else:
-                raise ValueError(f"Invalid rollout filter type: {self.config.actor_rollout_ref.rollout.rollout_filter_type}")
-
-            mask = torch.zeros(num_groups, dtype=torch.bool)
-            mask[top_groups] = True
-            mask = mask.unsqueeze(1).expand(-1, group_size).flatten()
-
-            batch.batch = batch.batch[mask]
-
-            for key, value in batch.non_tensor_batch.items():
-                if isinstance(value, np.ndarray):
-                    batch.non_tensor_batch[key] = value[mask]
-                else:
-                    batch.non_tensor_batch[key] = [v for v, m in zip(value, mask) if m]
-
-            metrics = {
-                "rollout/in_group_std": in_group_std.mean(),
-                "rollout/in_group_max": in_group_max.mean(),
-                "rollout/in_group_mean": in_group_mean.mean(),
-                "rollout/chosen_in_group_std": in_group_std[top_groups].mean(),
-                "rollout/chosen_in_group_max": in_group_max[top_groups].mean(),
-                "rollout/chosen_in_group_mean": in_group_mean[top_groups].mean()
-            }
-            return batch, metrics
-
         import time
         self.start_time = time.time()
         for step in range(self.total_training_steps):
@@ -508,25 +399,21 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             batch: DataProto = DataProto()
             is_last_step = self.global_steps >= self.total_training_steps
 
-            with _timer("step", timing_raw):
+            with marked_timer("step", timing_raw):
                 # generate a batch
-                with _timer("gen", timing_raw):
+                with marked_timer("gen", timing_raw):
                     batch = self.agent_proxy.rollout(batch, val=False)
-                    batch, metrics = _filter_rollout(batch)
+                    batch, metrics = self.rollout_filter.filter(batch)
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})
 
                     inputs, outputs, scores = _process_batch_for_logging(batch)
                     # self._maybe_log_generations(inputs=inputs, outputs=outputs, scores=scores, _type="train")
 
-
-
-
-
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # TODO: check if this is correct. Not tested yer
                     logger.log("[NotImplemented] REMAX implementation is not tested yet in RAGEN. Exiting.")
                     exit()
-                    with _timer("gen_max", timing_raw):
+                    with marked_timer("gen_max", timing_raw):
                         gen_baseline_batch = deepcopy(batch)
                         gen_baseline_batch.meta_info["do_sample"] = False
                         gen_baseline_output = self.agent_proxy.rollout(gen_baseline_batch, val=False)
@@ -548,9 +435,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # batch = batch.union(gen_batch_output)
 
                 # NOTE reward normalization already done in ctx_manager, so set group size = 1 here
-                batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                            dtype=object)
-                # batch.non_tensor_batch["uid"] = batch.non_tensor_batch["group_ids"]
+                # batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                            # dtype=object)
+                
+                # NOTE: do not do reward normalization in ctx_manager, so we need to do it here
+                batch.non_tensor_batch["uid"] = batch.non_tensor_batch["group_ids"]
 
                 # batch.batch["response_mask"] = compute_response_mask(batch)
                 batch.batch["response_mask"] = batch.batch["loss_mask"]
@@ -564,7 +453,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                 if self.use_rm:
-                    with _timer("reward", timing_raw):
+                    with marked_timer("reward", timing_raw):
                     # compute reward model score
                         reward_tensor = self.rm_wg.compute_rm_score(batch)
                         batch = batch.union(reward_tensor)
@@ -575,15 +464,27 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                 # recompute old_log_probs
-                with _timer("old_log_prob", timing_raw):
+
+                with marked_timer("old_log_prob", timing_raw, color="blue"):
                     old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                    entropys = old_log_prob.batch["entropys"]
+                    response_masks = batch.batch["response_mask"]
+                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                    old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                    metrics.update(old_log_prob_metrics)
+                    old_log_prob.batch.pop("entropys")
                     batch = batch.union(old_log_prob)
-                    avg_old_log_prob = masked_mean(old_log_prob.batch["old_log_probs"], batch.batch["response_mask"])
-                    metrics.update({"rollout/old_log_prob": avg_old_log_prob})
+
+                    if "rollout_log_probs" in batch.batch.keys():
+                        # TODO: we may want to add diff of probs too.
+                        from verl.utils.debug.metrics import calculate_debug_metrics
+
+                        metrics.update(calculate_debug_metrics(batch))
 
                 if self.use_reference_policy:
                     # compute reference log_prob
-                    with _timer("ref", timing_raw):
+                    with marked_timer("ref", timing_raw, color="olive"):
                         if not self.ref_in_actor:
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                         else:
@@ -594,11 +495,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                 # compute values
                 if self.use_critic:
-                    with _timer("values", timing_raw):
+                    with marked_timer("values", timing_raw):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
 
-                with _timer("adv", timing_raw):
+                with marked_timer("adv", timing_raw):
                     # we combine with rule-based rm
                     reward_extra_infos_dict: dict[str, list]
                     if self.config.reward_model.launch_reward_fn_async:
@@ -642,7 +543,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                 # update critic
                 if self.use_critic:
-                    with _timer("update_critic", timing_raw):
+                    with marked_timer("update_critic", timing_raw, color="pink"):
                         critic_output = self.critic_wg.update_critic(batch)
                     critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                     metrics.update(critic_output_metrics)
@@ -650,7 +551,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # implement critic warmup
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
-                    with _timer("update_actor", timing_raw):
+                    with marked_timer("update_actor", timing_raw):
                         batch.meta_info["multi_turn"] = True
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -659,7 +560,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # Log rollout generations if enabled
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                 if rollout_data_dir:
-                    with _timer("dump_rollout_generations", timing_raw):
+                    with marked_timer("dump_rollout_generations", timing_raw):
                         print(batch.batch.keys())
                         inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                         outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
@@ -674,14 +575,14 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                 # validate
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                    with _timer("testing", timing_raw):
+                    with marked_timer("testing", timing_raw):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
                 if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                    with _timer("save_checkpoint", timing_raw):
+                    with marked_timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
 
             # collect metrics
