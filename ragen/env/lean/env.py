@@ -221,10 +221,16 @@ class LeanEnv(BaseLanguageBasedEnv):
             }
         )
         self._latest_proof_text = self._construct_proof(self.tactic_history)
+        
+        done = False
+        if self.num_env_steps >= self.config.max_steps:
+            done = True
+            reward += self.config.max_steps_penalty
+
         return (
             self.render(),
             reward,
-            False,
+            done,
             {
                 "action_is_valid": False,
                 "action_is_effective": False,
