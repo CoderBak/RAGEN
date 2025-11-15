@@ -190,14 +190,34 @@ class LeanEnv(BaseLanguageBasedEnv):
     def _handle_empty_action(self):
         reward = self.config.step_penalty + self.config.invalid_step_reward
         message = "Empty tactic is not allowed."
-        self.last_feedback = message
+        message_obj = {
+            "severity": "error",
+            "data": message,
+        }
+        formatted_messages = self._format_message_objects_verbose([message_obj])
+        self.last_feedback = formatted_messages[0] if formatted_messages else message
+        self.last_result = _LeanStepResult(
+            status="invalid",
+            accepted=False,
+            success=False,
+            message_objects=[message_obj],
+            diagnostics={},
+            lean_time=0.0,
+            response=None,
+            raw_response={},
+        )
+        self._last_structured_feedback = {
+            "messages": formatted_messages,
+            "message_objects": [message_obj],
+            "accepted": False,
+        }
         self.num_env_steps += 1
         self.proof_log.append(
             {
                 "action": "",
                 "accepted": False,
-                "messages": [message],
-                "message_objects": [],
+                "messages": formatted_messages,
+                "message_objects": [message_obj],
             }
         )
         self._latest_proof_text = self._construct_proof(self.tactic_history)
@@ -210,8 +230,8 @@ class LeanEnv(BaseLanguageBasedEnv):
                 "action_is_effective": False,
                 "success": False,
                 "accepted": False,
-                "messages": [message],
-                "message_objects": [],
+                "messages": formatted_messages,
+                "message_objects": [message_obj],
             },
         )
 
@@ -518,9 +538,9 @@ class LeanEnv(BaseLanguageBasedEnv):
             return cached
 
         if not dataset_name:
-            logger.error("LeanEnv requires a dataset_name to load training samples.")
-            _DATASET_CACHE[cache_key] = []
-            return []
+            message = "LeanEnv requires a dataset_name to load training samples."
+            logger.error(message)
+            raise AssertionError(message)
 
         from datasets import load_dataset
 
@@ -531,14 +551,9 @@ class LeanEnv(BaseLanguageBasedEnv):
                 streaming=False,
             )
         except Exception as exc:
-            logger.error(
-                "Failed to load dataset %s (%s): %s",
-                dataset_name,
-                dataset_split,
-                exc,
-            )
-            _DATASET_CACHE[cache_key] = []
-            return []
+            message = f"Failed to load dataset {dataset_name} ({dataset_split}): {exc}"
+            logger.error(message)
+            raise AssertionError(message)
 
         records: List[Dict[str, Any]] = []
         for idx, example in enumerate(hf_dataset):
@@ -547,11 +562,13 @@ class LeanEnv(BaseLanguageBasedEnv):
                 records.append(parsed)
 
         if not records:
-            logger.warning(
-                "Dataset %s yielded no usable samples. Available columns: %s",
-                dataset_name,
-                list(getattr(hf_dataset, "column_names", [])),
+            available = list(getattr(hf_dataset, "column_names", []))
+            message = (
+                f"Dataset {dataset_name} yielded no usable samples. "
+                f"Available columns: {available}"
             )
+            logger.error(message)
+            raise AssertionError(message)
 
         _DATASET_CACHE[cache_key] = records
         return records

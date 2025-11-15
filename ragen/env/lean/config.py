@@ -6,7 +6,7 @@ class LeanEnvConfig:
     """Configuration options for the Lean theorem-proving environment."""
 
     dataset_name_or_path: str = field(
-        default="CoderBak/lean-workbook",
+        default="CoderBak/minif2f",
         metadata={"description": "Hugging Face dataset identifier or local path."},
     )
     dataset_split: str = field(
@@ -66,7 +66,7 @@ class LeanEnvConfig:
         },
     )
     default_imports: str = field(
-        default="import Mathlib\nimport Aesop",
+        default="import Mathlib\nimport Aesop\nset_option maxHeartbeats 0\nopen BigOperators Real Nat Topology Rat",
         metadata={"description": "Imports prepended when dataset sample omits them."},
     )
     message_truncate_limit: int = field(
